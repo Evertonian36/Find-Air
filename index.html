@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b7a4b">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Free Air Finder</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+:root{--bg:#f6f7f4;--card:#fff;--ink:#16211b;--mute:#66736b;--line:#dde2dc;--acc:#0b7a4b;--warn:#b26a00;--bad:#9a3b3b}
+@media(prefers-color-scheme:dark){:root{--bg:#121714;--card:#1b231e;--ink:#e8efe9;--mute:#9aa8a0;--line:#2c382f;--acc:#4cc38a;--warn:#e0a24a;--bad:#d98080}}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.4 system-ui,-apple-system,Segoe UI,sans-serif}
+header{padding:calc(10px + env(safe-area-inset-top)) 14px 8px}
+h1{font-size:20px;margin:0}
+.sub{color:var(--mute);font-size:13px}
+#map{height:46vh;min-height:280px;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.bar{display:flex;gap:6px;padding:10px 14px;align-items:center;flex-wrap:wrap}
+.chip{padding:7px 12px;border:1px solid var(--line);border-radius:999px;font-size:14px;background:var(--card);cursor:pointer;user-select:none}
+.chip.on{background:var(--acc);color:#fff;border-color:var(--acc)}
+@media(prefers-color-scheme:dark){.chip.on{color:#08130d}}
+button.go,a.go{padding:8px 12px;border-radius:8px;border:1px solid var(--acc);background:var(--acc);color:#fff;font:600 14px system-ui;text-decoration:none;cursor:pointer;display:inline-block}
+@media(prefers-color-scheme:dark){button.go,a.go{color:#08130d}}
+button.alt{background:transparent;color:var(--acc)}
+#status{padding:0 14px 6px;color:var(--mute);font-size:13px}
+#list{padding:0 14px calc(24px + env(safe-area-inset-bottom))}
+.item{display:flex;gap:10px;align-items:flex-start;padding:12px 0;border-top:1px solid var(--line);cursor:pointer}
+.dist{min-width:60px;font-weight:700;font-size:18px}
+.dist small{display:block;font-weight:400;color:var(--mute);font-size:12px}
+.meta{flex:1;min-width:0}
+.name{font-weight:600;overflow-wrap:anywhere}
+.tags{color:var(--mute);font-size:13px}
+.free{color:var(--acc);font-weight:600}.paid{color:var(--bad);font-weight:600}.unk{color:var(--warn);font-weight:600}
+.foot{padding:0 14px 24px;color:var(--mute);font-size:12px}
+.leaflet-popup-content{font:14px/1.4 system-ui}
+</style>
+</head>
+<body>
+<header>
+  <h1>Free Air Finder</h1>
+  <div class="sub">Tire inflators from OpenStreetMap</div>
+</header>
+<div id="map"></div>
+<div class="bar">
+  <span class="chip on" data-f="free">Free only</span>
+  <span class="chip" data-f="freeunk">Free + unknown</span>
+  <span class="chip" data-f="all">All</span>
+  <button class="go" id="here">My location</button>
+  <button class="go alt" id="area">Search this area</button>
+  <button class="go alt" id="fl">Reload Florida</button>
+</div>
+<div id="status">Starting…</div>
+<div id="list"></div>
+<div class="foot">Data © OpenStreetMap contributors (ODbL). Volunteer-edited: a pump may be broken or no longer free. “Fee unknown” means nobody has tagged the fee. Know a free pump that is missing? Add it on openstreetmap.org with <code>amenity=compressed_air</code> and <code>fee=no</code>.</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const ENDPOINTS=['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter','https://overpass.private.coffee/api/interpreter'];
+const DEFAULT=[27.7500,-82.6900]; // St. Petersburg 33711
+let me=null, filter='free', places=[], markers=L.layerGroup(), meMarker=null, busy=false;
+try{const s=JSON.parse(localStorage.getItem('lastPos')||'null');if(s)me=s}catch(e){}
+
+const map=L.map('map',{zoomControl:true,preferCanvas:true}).setView(me||DEFAULT,12);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
+markers.addTo(map);
+
+const $=id=>document.getElementById(id);
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const rad=d=>d*Math.PI/180,R=3958.8;
+const dist=(a,b,c,d)=>{const x=rad(c-a),y=rad(d-b),h=Math.sin(x/2)**2+Math.cos(rad(a))*Math.cos(rad(c))*Math.sin(y/2)**2;return 2*R*Math.asin(Math.sqrt(h))};
+const COL={free:'#0b7a4b',paid:'#9a3b3b',unk:'#d98f1f'};
+
+function parse(j){
+  const seen=new Set(),out=[];
+  for(const e of j.elements||[]){
+    const t=e.tags||{},lat=e.lat??e.center?.lat,lon=e.lon??e.center?.lon;
+    if(lat==null||lon==null)continue;
+    const k=e.type+e.id;if(seen.has(k))continue;seen.add(k);
+    const fr=t.fee??t['compressed_air:fee'];
+    const standalone=t.amenity==='compressed_air';
+    out.push({lat,lon,fee:fr==='no'?'free':fr==='yes'?'paid':'unk',
+      name:t.name||t.brand||t.operator||(standalone?'Air pump':'Gas station / business'),
+      sub:[standalone?'Standalone pump':'Station with air',t.brand&&t.brand!==t.name?t.brand:'',t.opening_hours||'',t['addr:street']?((t['addr:housenumber']||'')+' '+t['addr:street']).trim():''].filter(Boolean).join(' · ')});
+  }
+  return out;
+}
+
+const FL='24.40,-87.70,31.10,-79.90';
+async function fetchArea(all){
+  if(busy)return;busy=true;
+  const b=map.getBounds().pad(0.1);
+  const bb=all===true?FL:[b.getSouth(),b.getWest(),b.getNorth(),b.getEast()].map(n=>n.toFixed(5)).join(',');
+  if(all===true){try{const c=JSON.parse(localStorage.getItem('flData')||'null');if(c&&Date.now()-c.t<864e5&&c.p.length){places=c.p;busy=false;render();return}}catch(e){}}
+  const q=`[out:json][timeout:120];(nwr["amenity"="compressed_air"](${bb});nwr["compressed_air"="yes"](${bb}););out center tags;`;
+  $('status').textContent='Searching OpenStreetMap…';
+  let lastErr='';
+  for(const ep of ENDPOINTS){
+    try{
+      const r=await fetch(ep,{method:'POST',body:'data='+encodeURIComponent(q),headers:{'Content-Type':'application/x-www-form-urlencoded'}});
+      if(!r.ok)throw new Error('HTTP '+r.status);
+      places=parse(await r.json());busy=false;if(all===true){try{localStorage.setItem('flData',JSON.stringify({t:Date.now(),p:places}))}catch(e){}}render();return;
+    }catch(e){lastErr=e.message}
+  }
+  busy=false;$('status').textContent='Could not reach OpenStreetMap ('+lastErr+'). Tap “Search this area” to retry.';
+}
+
+function ref(){return me||[map.getCenter().lat,map.getCenter().lng]}
+
+function render(){
+  const [rl,ro]=ref();
+  let v=places.filter(p=>filter==='all'||p.fee==='free'||(filter==='freeunk'&&p.fee==='unk'))
+    .map(p=>({...p,d:dist(rl,ro,p.lat,p.lon)})).sort((a,b)=>a.d-b.d);
+  markers.clearLayers();
+  v.slice(0,1500).forEach(p=>{
+    const m=L.circleMarker([p.lat,p.lon],{radius:9,color:'#fff',weight:2,fillColor:COL[p.fee],fillOpacity:.95});
+    m.bindPopup(popup(p));p._m=m;m.addTo(markers);
+  });
+  const total=places.length,free=places.filter(p=>p.fee==='free').length;
+  $('status').textContent=`${total} found, ${free} tagged free. Showing ${v.length}${me?' · sorted from your location':' · sorted from map center'}.`;
+  $('list').innerHTML=v.slice(0,40).map((p,i)=>`<div class="item" data-i="${i}"><div class="dist">${p.d.toFixed(1)}<small>miles</small></div><div class="meta"><div class="name">${esc(p.name)}</div><div class="tags">${lab(p)} · ${esc(p.sub)}</div></div><a class="go" target="_blank" rel="noopener" href="${nav(p)}" onclick="event.stopPropagation()">Navigate</a></div>`).join('')||'<p class="tags">Nothing matches here. Try “Free + unknown”, zoom out, or tap “Search this area”.</p>';
+  $('list').onclick=ev=>{const it=ev.target.closest('.item');if(!it)return;const p=v[+it.dataset.i];map.setView([p.lat,p.lon],17);p._m.openPopup();window.scrollTo({top:0,behavior:'smooth'})};
+}
+const lab=p=>p.fee==='free'?'<span class="free">Free</span>':p.fee==='paid'?'<span class="paid">Paid</span>':'<span class="unk">Fee unknown</span>';
+const nav=p=>`https://www.google.com/maps/dir/?api=1&destination=${p.lat},${p.lon}`;
+const popup=p=>`<b>${esc(p.name)}</b><br>${lab(p)}<br>${esc(p.sub)}<br><a href="${nav(p)}" target="_blank" rel="noopener">Navigate</a>`;
+
+function locate(cb){
+  if(!navigator.geolocation){$('status').textContent='Location is not available here. Using St. Petersburg.';cb&&cb();return}
+  navigator.geolocation.getCurrentPosition(pos=>{
+    me=[pos.coords.latitude,pos.coords.longitude];
+    try{localStorage.setItem('lastPos',JSON.stringify(me))}catch(e){}
+    if(meMarker)meMarker.remove();
+    meMarker=L.circleMarker(me,{radius:8,color:'#fff',weight:3,fillColor:'#2a6df4',fillOpacity:1}).addTo(map);
+    map.setView(me,13);cb&&cb();
+  },()=>{$('status').textContent='Location blocked, using St. Petersburg. Allow location to sort from where you are.';cb&&cb()},{enableHighAccuracy:true,timeout:10000,maximumAge:60000});
+}
+
+document.querySelectorAll('.chip').forEach(c=>c.onclick=()=>{filter=c.dataset.f;document.querySelectorAll('.chip').forEach(x=>x.classList.toggle('on',x===c));render()});
+$('here').onclick=()=>locate(render);
+$('area').onclick=()=>fetchArea();
+$('fl').onclick=()=>{try{localStorage.removeItem('flData')}catch(e){}fetchArea(true)};
+locate(()=>fetchArea(true));
+</script>
+</body>
+</html>
